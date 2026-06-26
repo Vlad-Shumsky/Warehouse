@@ -1,6 +1,6 @@
-import streamlit as st
-import pandas as pd
-from sqlalchemy import text
+import streamlit as st # type: ignore
+import pandas as pd # type: ignore
+from sqlalchemy import text # type: ignore
 import hashlib
 
 st.set_page_config(page_title="Управление складом", page_icon="📦", layout="centered")
@@ -173,41 +173,133 @@ else:
         st.markdown("---")
 
         st.header("➕ Добавить товар")
-        with st.form("add_item_form", clear_on_submit=True):
-            raw_sku_input = st.text_input("Артикул:").strip()
-            new_location = st.text_input("Место на складе:").strip()
-            add_qty = st.number_input("Количество:", min_value=1, value=1, step=1)
-            submit_btn = st.form_submit_button("Добавить")
+        
+        MAPPING_TABLE = "barcode_mapping"
+
+        # 1. Initialize all memory states at the top
+        if "clear_add_fields" not in st.session_state:
+            st.session_state["clear_add_fields"] = False
+        if "add_success_msg" not in st.session_state:
+            st.session_state["add_success_msg"] = None
+        if "last_processed_input" not in st.session_state:
+            st.session_state.last_processed_input = ""
+        if "was_autofilled" not in st.session_state:
+            st.session_state["was_autofilled"] = False
+
+        # Pre-emptive field clearance BEFORE widgets are drawn
+        if st.session_state["clear_add_fields"]:
+            st.session_state["add_sku_field"] = ""
+            st.session_state["add_loc_field"] = ""
+            st.session_state["last_processed_input"] = ""
+            st.session_state["was_autofilled"] = False
+            st.session_state["clear_add_fields"] = False
+
+        # 2. Intercept, clean, and format input BEFORE rendering the text box
+        if "add_sku_field" in st.session_state and st.session_state["add_sku_field"].strip():
+            current_input = st.session_state["add_sku_field"].strip()
+            clean_input = clean_alphanumeric(current_input).upper()
             
-            if submit_btn:
-                if raw_sku_input and new_location:
-                    core_sku = clean_alphanumeric(raw_sku_input).upper()
-                    
-                    if len(core_sku) != 8:
-                        st.error(f"❌ Неверная длина артикука.")
-                    else:
-                        formatted_sku = f"{core_sku[:3]}*{core_sku[3:5]} {core_sku[5:]}"
-                        
-                        check_query = f"SELECT quantity FROM {TABLE_NAME} WHERE sku = :sku AND location = :loc;"
-                        dup_check = conn.query(check_query, params={"sku": formatted_sku, "loc": new_location}, ttl=0)
-                        
-                        with conn.session as session:
-                            if not dup_check.empty:
-                                existing_qty = int(dup_check.iloc[0]["quantity"])
-                                session.execute(
-                                    text(f"UPDATE {TABLE_NAME} SET quantity = :qty, last_replenished = NOW() WHERE sku = :sku AND location = :loc;"),
-                                    {"qty": existing_qty + add_qty, "sku": formatted_sku, "loc": new_location}
-                                )
-                                st.success(f"✅ Артикул **{formatted_sku}** в **{new_location}** пополнен. Всего: {existing_qty + add_qty} штук.")
-                            else:
-                                session.execute(
-                                    text(f"INSERT INTO {TABLE_NAME} (sku, location, quantity) VALUES (:sku, :loc, :qty);"),
-                                    {"sku": formatted_sku, "loc": new_location, "qty": add_qty}
-                                )
-                                st.success(f"✅ Артикул **{formatted_sku}** добавлен в **{new_location}**.")
-                            session.commit()
+            if st.session_state.last_processed_input != clean_input:
+                st.session_state["was_autofilled"] = False
+                
+                # Check cross-reference table for a barcode match
+                map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = :barcode LIMIT 1;"
+                map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                
+                if not map_df.empty:
+                    # Found a barcode! Strip whatever format Excel has down to 8 raw characters
+                    raw_sku = clean_alphanumeric(str(map_df.iloc[0]["sku"])).upper()
                 else:
-                    st.warning("Пожалуйста, заполните все поля.")
+                    # No barcode found; treat the input itself as a raw manual SKU entry
+                    raw_sku = clean_input
+
+                # Apply pretty formatting uniform structure if it resolves to an 8-char SKU
+                if len(raw_sku) == 8:
+                    pretty_sku = f"{raw_sku[:3]}*{raw_sku[3:5]} {raw_sku[5:]}"
+                    # 🔄 FORCE VISUAL SWAP: Overwrite the box value with the beautiful format
+                    st.session_state["add_sku_field"] = pretty_sku
+                    target_sku_for_lookup = pretty_sku
+                else:
+                    target_sku_for_lookup = raw_sku
+
+                # Look up existing warehouse location using the standardized SKU format
+                if len(raw_sku) == 8:
+                    loc_query = f"SELECT location FROM {TABLE_NAME} WHERE sku = :sku LIMIT 1;"
+                    loc_df = conn.query(loc_query, params={"sku": target_sku_for_lookup}, ttl=0)
+                    
+                    if not loc_df.empty:
+                        st.session_state["add_loc_field"] = str(loc_df.iloc[0]["location"])
+                        st.session_state["was_autofilled"] = True
+                    else:
+                        st.session_state["add_loc_field"] = ""
+                else:
+                    st.session_state["add_loc_field"] = ""
+                
+                # Lock down this cleaned token to prevent redundant query loops
+                st.session_state.last_processed_input = clean_input
+        else:
+            st.session_state.last_processed_input = ""
+            st.session_state["was_autofilled"] = False
+
+        # 3. Render the main SKU/Barcode input field
+        raw_input = st.text_input("Штрихкод или Артикул:", key="add_sku_field").strip()
+
+        # Dismiss old success message on fresh interaction
+        if raw_input and st.session_state["add_success_msg"]:
+            st.session_state["add_success_msg"] = None
+
+        # 4. Precision Blue Info Box (Only triggers on a genuine database autofill)
+        if st.session_state["was_autofilled"] and not st.session_state["add_success_msg"]:
+            st.info(f"💡 Этот артикул уже есть на складе в ячейке: **{st.session_state['add_loc_field']}**. Место подставлено автоматически.")
+
+        # 5. Render remaining input elements
+        new_location = st.text_input("Место на складе:", key="add_loc_field").strip()
+        add_qty = st.number_input("Количество:", min_value=1, value=1, step=1, key="add_qty_field")
+        
+        if st.session_state["add_success_msg"]:
+            st.success(st.session_state["add_success_msg"])
+
+        # 6. Submission Execution block
+        submit_btn = st.button("Добавить товар в базу", use_container_width=True)
+        
+        if submit_btn:
+            if raw_input and new_location:
+                clean_input = clean_alphanumeric(raw_input).upper()
+                
+                # Re-resolve backend mapping safely on submit action
+                map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = :barcode LIMIT 1;"
+                map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                final_sku_raw = clean_alphanumeric(str(map_df.iloc[0]["sku"])).upper() if not map_df.empty else clean_input
+                
+                if len(final_sku_raw) != 8:
+                    st.error(f"❌ Не удалось распознать артикул (Длина: {len(final_sku_raw)}). Проверьте таблицу соответствий.")
+                else:
+                    formatted_sku = f"{final_sku_raw[:3]}*{final_sku_raw[3:5]} {final_sku_raw[5:]}"
+                    
+                    check_query = f"SELECT quantity FROM {TABLE_NAME} WHERE sku = :sku AND location = :loc;"
+                    dup_check = conn.query(check_query, params={"sku": formatted_sku, "loc": new_location}, ttl=0)
+                    
+                    with conn.session as session:
+                        if not dup_check.empty:
+                            existing_qty = int(dup_check.iloc[0]["quantity"])
+                            new_total = existing_qty + add_qty
+                            session.execute(
+                                text(f"UPDATE {TABLE_NAME} SET quantity = :qty, last_replenished = NOW() WHERE sku = :sku AND location = :loc;"),
+                                {"qty": new_total, "sku": formatted_sku, "loc": new_location}
+                            )
+                            st.session_state["add_success_msg"] = f"✅ Артикул **{formatted_sku}** в **{new_location}** пополнен. Всего: {new_total} штук."
+                        else:
+                            session.execute(
+                                text(f"INSERT INTO {TABLE_NAME} (sku, location, quantity) VALUES (:sku, :loc, :qty);"),
+                                {"sku": formatted_sku, "loc": new_location, "qty": add_qty}
+                            )
+                            st.session_state["add_success_msg"] = f"✅ Артикул **{formatted_sku}** добавлен в **{new_location}**."
+                        session.commit()
+                    
+                    st.session_state["clear_add_fields"] = True
+                    st.rerun()
+            else:
+                st.warning("Пожалуйста, заполните все поля.")
 
     # =========================================================
     # ВКЛАДКА 2: ПРОСМОТР БАЗЫ (СПИСОК)
