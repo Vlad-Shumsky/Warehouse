@@ -60,12 +60,11 @@ if not st.session_state.authenticated:
         reg_pass = st.text_input("Придумайте пароль:", type="password", key="reg_pass_input")
         reg_pass_conf = st.text_input("Подтвердите пароль:", type="password", key="reg_pass_conf_input")
         
-        # 🔐 NEW: The gatekeeper field
+        # 🔐 Ключ регистрации
         reg_key = st.text_input("Ключ регистрации (Выдается администратором):", type="password", key="reg_key_input")
         
         if st.button("Создать аккаунт", use_container_width=True):
             if reg_user and reg_pass and reg_key:
-                # Pull the master secret key from your hidden configuration
                 master_key = st.secrets.get("registration", {}).get("master_key", "FALLBACK_NOT_SET")
                 
                 if reg_key != master_key:
@@ -75,14 +74,12 @@ if not st.session_state.authenticated:
                 elif len(reg_pass) < 4:
                     st.error("❌ Пароль должен содержать не менее 4 символов.")
                 else:
-                    # Check if username is already taken
                     check_query = f"SELECT username FROM {USER_TABLE} WHERE username = :user;"
                     dup_user = conn.query(check_query, params={"user": reg_user}, ttl=0)
                     
                     if not dup_user.empty:
                         st.error("❌ Этот логин уже занят.")
                     else:
-                        # Write the new user details with a hashed password
                         hashed = make_hash(reg_pass)
                         with conn.session as session:
                             session.execute(
@@ -98,7 +95,6 @@ if not st.session_state.authenticated:
 # ОСНОВНОЙ ИНТЕРФЕЙС ПРИЛОЖЕНИЯ (ПОСЛЕ ВХОДА)
 # =========================================================
 else:
-    # Боковая панель (Sidebar) с информацией о сессии и кнопкой выхода
     st.sidebar.title("👤 Пользователь")
     st.sidebar.write(f"Вы вошли как: **{st.session_state.username.upper()}**")
     if st.sidebar.button("🚪 Выйти из системы", use_container_width=True):
@@ -176,7 +172,6 @@ else:
         
         MAPPING_TABLE = "barcode_mapping"
 
-        # 1. Initialize all memory states at the top
         if "clear_add_fields" not in st.session_state:
             st.session_state["clear_add_fields"] = False
         if "add_success_msg" not in st.session_state:
@@ -186,7 +181,6 @@ else:
         if "was_autofilled" not in st.session_state:
             st.session_state["was_autofilled"] = False
 
-        # Pre-emptive field clearance BEFORE widgets are drawn
         if st.session_state["clear_add_fields"]:
             st.session_state["add_sku_field"] = ""
             st.session_state["add_loc_field"] = ""
@@ -194,35 +188,38 @@ else:
             st.session_state["was_autofilled"] = False
             st.session_state["clear_add_fields"] = False
 
-        # 2. Intercept, clean, and format input BEFORE rendering the text box
+        # 2. ✅ Блок перехвата, очистки и автозаполнения по штрихкоду
         if "add_sku_field" in st.session_state and st.session_state["add_sku_field"].strip():
             current_input = st.session_state["add_sku_field"].strip()
             clean_input = clean_alphanumeric(current_input).upper()
             
-            if st.session_state.last_processed_input != clean_input:
+            # Проверяем, редактирует ли пользователь уже отформатированный SKU (содержит пробелы или *)
+            is_editing_formatted = " " in current_input or "*" in current_input
+            
+            if (st.session_state.last_processed_input != clean_input 
+                and len(clean_input) in [8, 10, 13] 
+                and not is_editing_formatted):
+                
                 st.session_state["was_autofilled"] = False
                 
-                # Check cross-reference table for a barcode match
-                map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = :barcode LIMIT 1;"
-                map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                if clean_input.isdigit():
+                    map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = CAST(:barcode AS bigint) LIMIT 1;"
+                    map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                else:
+                    map_df = pd.DataFrame()
                 
                 if not map_df.empty:
-                    # Found a barcode! Strip whatever format Excel has down to 8 raw characters
                     raw_sku = clean_alphanumeric(str(map_df.iloc[0]["sku"])).upper()
                 else:
-                    # No barcode found; treat the input itself as a raw manual SKU entry
                     raw_sku = clean_input
 
-                # Apply pretty formatting uniform structure if it resolves to an 8-char SKU
                 if len(raw_sku) == 8:
                     pretty_sku = f"{raw_sku[:3]}*{raw_sku[3:5]} {raw_sku[5:]}"
-                    # 🔄 FORCE VISUAL SWAP: Overwrite the box value with the beautiful format
                     st.session_state["add_sku_field"] = pretty_sku
                     target_sku_for_lookup = pretty_sku
                 else:
                     target_sku_for_lookup = raw_sku
 
-                # Look up existing warehouse location using the standardized SKU format
                 if len(raw_sku) == 8:
                     loc_query = f"SELECT location FROM {TABLE_NAME} WHERE sku = :sku LIMIT 1;"
                     loc_df = conn.query(loc_query, params={"sku": target_sku_for_lookup}, ttl=0)
@@ -230,45 +227,44 @@ else:
                     if not loc_df.empty:
                         st.session_state["add_loc_field"] = str(loc_df.iloc[0]["location"])
                         st.session_state["was_autofilled"] = True
-                    else:
-                        st.session_state["add_loc_field"] = ""
                 else:
-                    st.session_state["add_loc_field"] = ""
+                    st.session_state["was_autofilled"] = False
                 
-                # Lock down this cleaned token to prevent redundant query loops
+                st.session_state.last_processed_input = clean_input
+            elif is_editing_formatted:
+                # Позволяет моментально обновлять сохраненное состояние при первом ручном редактировании артикула
                 st.session_state.last_processed_input = clean_input
         else:
             st.session_state.last_processed_input = ""
             st.session_state["was_autofilled"] = False
 
-        # 3. Render the main SKU/Barcode input field
         raw_input = st.text_input("Штрихкод или Артикул:", key="add_sku_field").strip()
 
-        # Dismiss old success message on fresh interaction
         if raw_input and st.session_state["add_success_msg"]:
             st.session_state["add_success_msg"] = None
 
-        # 4. Precision Blue Info Box (Only triggers on a genuine database autofill)
         if st.session_state["was_autofilled"] and not st.session_state["add_success_msg"]:
             st.info(f"💡 Этот артикул уже есть на складе в ячейке: **{st.session_state['add_loc_field']}**. Место подставлено автоматически.")
 
-        # 5. Render remaining input elements
         new_location = st.text_input("Место на складе:", key="add_loc_field").strip()
         add_qty = st.number_input("Количество:", min_value=1, value=1, step=1, key="add_qty_field")
         
         if st.session_state["add_success_msg"]:
             st.success(st.session_state["add_success_msg"])
 
-        # 6. Submission Execution block
+        # 6. Блок сохранения данных
         submit_btn = st.button("Добавить товар в базу", use_container_width=True)
         
         if submit_btn:
             if raw_input and new_location:
                 clean_input = clean_alphanumeric(raw_input).upper()
                 
-                # Re-resolve backend mapping safely on submit action
-                map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = :barcode LIMIT 1;"
-                map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                if clean_input.isdigit():
+                    map_query = f"SELECT sku FROM {MAPPING_TABLE} WHERE barcode = CAST(:barcode AS bigint) LIMIT 1;"
+                    map_df = conn.query(map_query, params={"barcode": clean_input}, ttl=0)
+                else:
+                    map_df = pd.DataFrame()
+                
                 final_sku_raw = clean_alphanumeric(str(map_df.iloc[0]["sku"])).upper() if not map_df.empty else clean_input
                 
                 if len(final_sku_raw) != 8:
@@ -289,8 +285,9 @@ else:
                             )
                             st.session_state["add_success_msg"] = f"✅ Артикул **{formatted_sku}** в **{new_location}** пополнен. Всего: {new_total} штук."
                         else:
+                            # Добавляем NOW() при вставке новых строк
                             session.execute(
-                                text(f"INSERT INTO {TABLE_NAME} (sku, location, quantity) VALUES (:sku, :loc, :qty);"),
+                                text(f"INSERT INTO {TABLE_NAME} (sku, location, quantity, last_replenished) VALUES (:sku, :loc, :qty, NOW());"),
                                 {"sku": formatted_sku, "loc": new_location, "qty": add_qty}
                             )
                             st.session_state["add_success_msg"] = f"✅ Артикул **{formatted_sku}** добавлен в **{new_location}**."
@@ -313,7 +310,16 @@ else:
         with search_col2:
             search_loc = st.text_input("Поиск по месту:", value="", key="browser_loc").strip()
         
-        base_query = f"SELECT sku, location, quantity, last_replenished FROM {TABLE_NAME} WHERE 1=1"
+        # ✅ Форматируем дату напрямую через PostgreSQL с помощью TO_CHAR во избежание конфликтов типов в Pandas
+        base_query = f"""
+            SELECT 
+                sku, 
+                location, 
+                quantity, 
+                COALESCE(TO_CHAR(last_replenished, 'DD.MM.YYYY'), '-') as last_replenished
+            FROM {TABLE_NAME} 
+            WHERE 1=1
+        """
         params = {}
         
         if browser_sku:
@@ -331,8 +337,6 @@ else:
         if not df_all.empty:
             df_display = df_all.copy()
             df_display.columns = ["Артикул", "Место на складе", "Количество", "Последнее пополнение"]
-            if df_display["Последнее пополнение"].dt.tz is not None:
-                df_display["Последнее пополнение"] = df_display["Последнее пополнение"].dt.tz_localize(None)
                 
             st.dataframe(df_display, use_container_width=True, hide_index=True)
             st.caption(f"Найдено позиций: {len(df_display)}.")
